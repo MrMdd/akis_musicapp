@@ -42,22 +42,29 @@ def supabase_dosyalari_listele():
 @app.post("/indir")
 def youtube_indir(data: LinkModel):
     ydl_opts = {
-    'format': 'bestaudio/best',
-    'outtmpl': f'{TMP_DIR}/%(title)s.%(ext)s',
-    'writethumbnail': True, 
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '192',
-    }],
-    'noplaylist': True,
-    # Engeli aşmak için eklenebilecek insansı başlıklar:
-    'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'format': 'bestaudio/best',
+        'outtmpl': f'{TMP_DIR}/%(title)s.%(ext)s',
+        'writethumbnail': True, 
+        'postprocessors': [
+            {
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }
+        ],
+        'noplaylist': True,
+        # YouTube blokajını aşmak için eklenen taklit başlıkları ve istemci ayarı:
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        }
     }
-}
     try:
         # 1. Şarkıyı geçici olarak Render diskine indir
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
