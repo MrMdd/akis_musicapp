@@ -11,8 +11,8 @@ app = FastAPI()
 # ==========================================
 # SUPABASE BAĞLANTI AYARLARI
 # ==========================================
-SUPABASE_URL = "BURAYA_SUPABASE_PROJECT_URL_YAZ"
-SUPABASE_KEY = "BURAYA_SUPABASE_ANON_KEY_YAZ"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 BUCKET_NAME = "musicfiles"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
