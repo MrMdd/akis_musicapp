@@ -1,36 +1,49 @@
 import os
 import shutil
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import yt_dlp
+from supabase import create_client, Client
 
 app = FastAPI()
 
-# Şarkıların ve kapakların kaydedileceği klasör yolu
-MUSIC_DIR = os.path.expanduser("~/musicapp/musicfiles")
+# ==========================================
+# SUPABASE BAĞLANTI AYARLARI
+# ==========================================
+SUPABASE_URL = "BURAYA_SUPABASE_PROJECT_URL_YAZ"
+SUPABASE_KEY = "BURAYA_SUPABASE_ANON_KEY_YAZ"
+BUCKET_NAME = "musicfiles"
 
-# Klasör yoksa otomatik oluşturulur
-os.makedirs(MUSIC_DIR, exist_ok=True)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# İndirme için link modeli
+# Render üzerinde geçici işlemler için kullanılacak klasör
+TMP_DIR = "/tmp/musicfiles"
+os.makedirs(TMP_DIR, exist_ok=True)
+
 class LinkModel(BaseModel):
     url: str
 
-# Şarkı adı ve başlık güncelleme modeli
 class GuncellemeModel(BaseModel):
-    eski_sarki_adi: str  # Örn: "Metallica - Master.mp3"
-    yeni_baslik: str     # Örn: "Metallica - Master of Puppets" (Uzantısız sade başlık)
+    eski_sarki_adi: str  
+    yeni_baslik: str     
 
-# Silme işlemi için model
 class SilmeModel(BaseModel):
-    sarki_adi: str  # Örn: "Metallica - One.mp3"
+    sarki_adi: str  
+
+# Yardımcı Fonksiyon: Supabase'deki tüm dosyaları listeler
+def supabase_dosyalari_listele():
+    try:
+        res = supabase.storage.from_(BUCKET_NAME).list("", {"limit": 1000})
+        return [item['name'] for item in res]
+    except Exception:
+        return []
 
 @app.post("/indir")
 def youtube_indir(data: LinkModel):
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': f'{MUSIC_DIR}/%(title)s.%(ext)s',
+        'outtmpl': f'{TMP_DIR}/%(title)s.%(ext)s',
         'writethumbnail': True, 
         'postprocessors': [
             {
@@ -42,16 +55,37 @@ def youtube_indir(data: LinkModel):
         'noplaylist': True,
     }
     try:
+        # 1. Şarkıyı geçici olarak Render diskine indir
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([data.url])
-        return {"durum": "basarili", "mesaj": "Sarki ve kapak resmi basariyla indirildi!"}
+            info = ydl.extract_info(data.url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+        temiz_ad = os.path.splitext(os.path.basename(filename))[0]
+        
+        # Geçici dizindeki dosyaları tara ve Supabase'e yükle
+        gecici_dosyalar = os.listdir(TMP_DIR)
+        for dosya in gecici_dosyalar:
+            if dosya.startswith(temiz_ad):
+                dosya_yolu = os.path.join(TMP_DIR, dosya)
+                
+                # 2. Supabase Storage'a yükle
+                with open(dosya_yolu, 'rb') as f:
+                    supabase.storage.from_(BUCKET_NAME).upload(
+                        path=dosya,
+                        file=f,
+                        file_options={"cache-control": "3600", "upsert": "true"}
+                    )
+                # 3. İşlem bitince Render diskinden sil (Yer kaplamasın)
+                os.remove(dosya_yolu)
+                
+        return {"durum": "basarili", "mesaj": "Sarki ve kapak resmi basariyla buluta yuklendi!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Indirme hatasi: {str(e)}")
 
 @app.get("/sarkilar")
 def sarkilari_listele():
     try:
-        dosyalar = os.listdir(MUSIC_DIR)
+        dosyalar = supabase_dosyalari_listele()
         mp3_dosyalari = [f for f in dosyalar if f.endswith('.mp3')]
         
         havuz = []
@@ -64,10 +98,13 @@ def sarkilari_listele():
                     kapak_adi = f"{sarki_adi}{ext}"
                     break
             
+            # Doğrudan Supabase üzerindeki public linkleri oluşturuyoruz
+            kapak_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{kapak_adi}" if kapak_adi else None
+            
             havuz.append({
                 "sarki_adi": mp3,
                 "baslik": sarki_adi,
-                "kapak_url": f"/kapak/{kapak_adi}" if kapak_adi else None
+                "kapak_url": kapak_url
             })
             
         return {"sarkilar": sorted(havuz, key=lambda x: x['baslik'])}
@@ -76,39 +113,23 @@ def sarkilari_listele():
 
 @app.get("/dinle/{sarki_adi}")
 def sarki_dinle(sarki_adi: str):
-    sarki_yolu = os.path.join(MUSIC_DIR, sarki_adi)
-    if os.path.exists(sarki_yolu):
-        return FileResponse(sarki_yolu, media_type="audio/mpeg")
-    raise HTTPException(status_code=404, detail="Sarki bulunamadi.")
+    # Şarkıyı Render üzerinden akıtmak yerine doğrudan Supabase public URL'ine yönlendiriyoruz (Hızlı ve Hatasız)
+    sarki_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{sarki_adi}"
+    return RedirectResponse(url=sarki_url)
 
 @app.get("/kapak/{resim_adi}")
 def kapak_resmi_getir(resim_adi: str):
-    resim_yolu = os.path.join(MUSIC_DIR, resim_adi)
-    if os.path.exists(resim_yolu):
-        media_type = "image/jpeg"
-        if resim_adi.endswith('.png'):
-            media_type = "image/png"
-        elif resim_adi.endswith('.webp'):
-            media_type = "image/webp"
-            
-        return FileResponse(resim_yolu, media_type=media_type)
-    raise HTTPException(status_code=404, detail="Kapak resmi bulunamadi.")
+    resim_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{resim_adi}"
+    return RedirectResponse(url=resim_url)
 
 @app.get("/ara")
 def youtube_ara(isim: str):
     if not isim:
         raise HTTPException(status_code=400, detail="Arama metni bos olamaz.")
-        
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'extract_flat': True,
-    }
-    
+    ydl_opts = {'format': 'bestaudio/best', 'noplaylist': True, 'extract_flat': True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             arama_sonucu = ydl.extract_info(f"ytsearch5:{isim}", download=False)
-            
         sonuclar = []
         if 'entries' in arama_sonucu:
             for entry in arama_sonucu['entries']:
@@ -125,111 +146,78 @@ def sarki_bilgi_guncelle(data: GuncellemeModel):
     if not data.eski_sarki_adi.endswith('.mp3'):
         raise HTTPException(status_code=400, detail="Eski sarki adi .mp3 ile bitmelidir.")
         
-    eski_sarki_yolu = os.path.join(MUSIC_DIR, data.eski_sarki_adi)
-    if not os.path.exists(eski_sarki_yolu):
-        raise HTTPException(status_code=404, detail="Guncellenmek istenen sarki dosyasi bulunamadi.")
+    dosyalar = supabase_dosyalari_listele()
+    if data.eski_sarki_adi not in dosyalar:
+        raise HTTPException(status_code=404, detail="Sarki bulutta bulunamadi.")
         
     eski_temiz_ad = data.eski_sarki_adi.replace('.mp3', '')
     yeni_temiz_ad = data.yeni_baslik.strip()
-    yeni_sarki_adi = f"{yeni_temiz_ad}.mp3"
-    yeni_sarki_yolu = os.path.join(MUSIC_DIR, yeni_sarki_adi)
     
-    if os.path.exists(yeni_sarki_yolu) and data.eski_sarki_adi != yeni_sarki_adi:
-        raise HTTPException(status_code=400, detail="Bu yeni isimde bir sarki zaten mevcut.")
-        
     try:
-        os.rename(eski_sarki_yolu, yeni_sarki_yolu)
+        # 1. MP3 Adını Taşı (Move/Rename)
+        supabase.storage.from_(BUCKET_NAME).move(data.eski_sarki_adi, f"{yeni_temiz_ad}.mp3")
         
-        dosyalar = os.listdir(MUSIC_DIR)
-        guncellenen_kapak = None
+        # 2. Varsa Kapağı Taşı
         for ext in ['.jpg', '.jpeg', '.png', '.webp']:
-            eski_kapak_adi = f"{eski_temiz_ad}{ext}"
-            if eski_kapak_adi in dosyalar:
-                eski_kapak_yolu = os.path.join(MUSIC_DIR, eski_kapak_adi)
-                yeni_kapak_adi = f"{yeni_temiz_ad}{ext}"
-                yeni_kapak_yolu = os.path.join(MUSIC_DIR, yeni_kapak_adi)
-                os.rename(eski_kapak_yolu, yeni_kapak_yolu)
-                guncellenen_kapak = yeni_kapak_adi
+            eski_kapak = f"{eski_temiz_ad}{ext}"
+            if eski_kapak in dosyalar:
+                supabase.storage.from_(BUCKET_NAME).move(eski_kapak, f"{yeni_temiz_ad}{ext}")
                 break
                 
-        return {
-            "durum": "basarili", 
-            "mesaj": "Sarki ismi ve kapak resmi basariyla guncellendi.",
-            "yeni_sarki_adi": yeni_sarki_adi,
-            "yeni_kapak_url": f"/kapak/{guncellenen_kapak}" if guncellenen_kapak else None
-        }
+        return {"durum": "basarili", "mesaj": "Buluttaki sarki ve kapak ismi guncellendi."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Duzenleme hatasi: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/guncelle/kapak")
 def sarki_kapak_guncelle(sarki_adi: str, file: UploadFile = File(...)):
     if not sarki_adi.endswith('.mp3'):
         raise HTTPException(status_code=400, detail="Sarki adi .mp3 ile bitmelidir.")
         
-    sarki_yolu = os.path.join(MUSIC_DIR, sarki_adi)
-    if not os.path.exists(sarki_yolu):
-        raise HTTPException(status_code=404, detail="Kapak yuklenmek istenen sarki bulunamadi.")
-        
     temiz_ad = sarki_adi.replace('.mp3', '')
-    
     dosya_uzantisi = os.path.splitext(file.filename)[1].lower()
-    if dosya_uzantisi not in ['.jpg', '.jpeg', '.png', '.webp']:
-        raise HTTPException(status_code=400, detail="Gecersiz resim formati. Sadece jpg, jpeg, png, webp desteklenir.")
-        
+    
     try:
-        dosyalar = os.listdir(MUSIC_DIR)
+        dosyalar = supabase_dosyalari_listele()
+        # Eski kapakları sil
         for ext in ['.jpg', '.jpeg', '.png', '.webp']:
             eski_kapak = f"{temiz_ad}{ext}"
             if eski_kapak in dosyalar:
-                os.remove(os.path.join(MUSIC_DIR, eski_kapak))
+                supabase.storage.from_(BUCKET_NAME).remove([eski_kapak])
                 
+        # Yeni kapağı yükle
         yeni_kapak_adi = f"{temiz_ad}{dosya_uzantisi}"
-        yeni_kapak_yolu = os.path.join(MUSIC_DIR, yeni_kapak_adi)
-        
-        with open(yeni_kapak_yolu, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        return {
-            "durum": "basarili", 
-            "mesaj": "Kapak resmi basariyla yenilendi.", 
-            "kapak_url": f"/kapak/{yeni_kapak_adi}"
-        }
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=yeni_kapak_adi,
+            file=file.file.read(),
+            file_options={"content-type": file.content_type, "upsert": "true"}
+        )
+        return {"durum": "basarili", "mesaj": "Kapak resmi bulutta yenilendi."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Kapak yukleme hatasi: {str(e)}")
-
-# ==========================================
-# YENİ EKLEME: SARKİ VE İLİŞİK TEMİZLEME KAPISI
-# ==========================================
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/sil")
 def sarki_sil(data: SilmeModel):
     if not data.sarki_adi.endswith('.mp3'):
         raise HTTPException(status_code=400, detail="Sarki adi .mp3 ile bitmelidir.")
         
-    sarki_yolu = os.path.join(MUSIC_DIR, data.sarki_adi)
-    if not os.path.exists(sarki_yolu):
-        raise HTTPException(status_code=404, detail="Silinmek istenen sarki dosyasi bulunamadi.")
-        
     temiz_ad = data.sarki_adi.replace('.mp3', '')
-    silinen_kapak_var_mi = False
     
     try:
-        # 1. Ana MP3 dosyasını diskten sil
-        os.remove(sarki_yolu)
+        dosyalar = supabase_dosyalari_listele()
+        silinecekler = []
         
-        # 2. Bu şarkıyla aynı isme sahip olan kapak resmini bul ve onu da sil
-        dosyalar = os.listdir(MUSIC_DIR)
+        if data.sarki_adi in dosyalar:
+            silinecekler.append(data.sarki_adi)
+            
         for ext in ['.jpg', '.jpeg', '.png', '.webp']:
             kapak_adi = f"{temiz_ad}{ext}"
             if kapak_adi in dosyalar:
-                os.remove(os.path.join(MUSIC_DIR, kapak_adi))
-                silinen_kapak_var_mi = True
-                break  # Kapak bulundu ve silindi, döngüden çık
+                silinecekler.append(kapak_adi)
+                break
                 
-        return {
-            "durum": "basarili",
-            "mesaj": f"'{data.sarki_adi}' ve ilişkili tüm dosyalar başarıyla sunucudan kazındı.",
-            "kapak_silindi_mi": silinen_kapak_var_mi
-        }
+        if silinecekler:
+            supabase.storage.from_(BUCKET_NAME).remove(silinecekler)
+            
+        return {"durum": "basarili", "mesaj": "Sarki ve ilisikleri buluttan temizlendi."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Silme islemi sirasinda hata olustu: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
